@@ -1,0 +1,9 @@
+services:
+  lecture-ml-service:
+    build: .
+    container_name: lecture-ml-service
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${APP_PORT:-8000}:8000"
