@@ -7,13 +7,13 @@ from typing import Any, Optional
 import httpx
 
 from app.config import (
-    GROQ_API_KEY,
-    GROQ_BASE_URL,
+    LLM_API_KEY,
+    LLM_API_URL,
     LLM_HEALTH_TTL_SECONDS,
     LLM_MAX_RETRIES,
-    LLM_RETRY_BACKOFF_SECONDS,
     LLM_MAX_TOKENS,
     LLM_MODEL,
+    LLM_RETRY_BACKOFF_SECONDS,
     LLM_TEMPERATURE,
     LLM_TIMEOUT_SECONDS,
 )
@@ -32,8 +32,8 @@ class LLMService:
     _health_lock = asyncio.Lock()
 
     def __init__(self) -> None:
-        self.base_url = GROQ_BASE_URL.rstrip("/")
-        self.api_key = GROQ_API_KEY
+        self.api_url = LLM_API_URL
+        self.api_key = LLM_API_KEY
         self.model = LLM_MODEL
         self.timeout = LLM_TIMEOUT_SECONDS
         self.temperature = LLM_TEMPERATURE
@@ -44,52 +44,20 @@ class LLMService:
 
     async def generate(self, prompt: str) -> str:
         if not self.api_key:
-            raise LLMServiceError("LLM_UNAVAILABLE", "GROQ_API_KEY is not set")
+            raise LLMServiceError("LLM_UNAVAILABLE", "LLM_API_KEY is not set")
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "prompt": prompt,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
+        data = await self._post_generate(payload)
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            last_exc: Optional[Exception] = None
-            for attempt in range(1, self.max_retries + 1):
-                try:
-                    response = await client.post(
-                        f"{self.base_url}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    text = _extract_text_from_llm_response(data)
-                    if not text.strip():
-                        raise LLMServiceError("LLM_UNAVAILABLE", "Empty LLM response")
-                    return text
-                except httpx.TimeoutException as exc:
-                    last_exc = exc
-                    if attempt >= self.max_retries:
-                        raise LLMServiceError("TIMEOUT", "LLM API timeout") from exc
-                except httpx.HTTPStatusError as exc:
-                    last_exc = exc
-                    status_code = exc.response.status_code
-                    # Retry only for transient statuses.
-                    if status_code not in {429, 500, 502, 503, 504} or attempt >= self.max_retries:
-                        raise LLMServiceError("LLM_UNAVAILABLE", f"LLM API returned {status_code}") from exc
-                except httpx.HTTPError as exc:
-                    last_exc = exc
-                    if attempt >= self.max_retries:
-                        raise LLMServiceError("LLM_UNAVAILABLE", f"LLM API error: {exc}") from exc
-
-                await asyncio.sleep(self.retry_backoff_seconds * attempt)
-
-            raise LLMServiceError("LLM_UNAVAILABLE", f"LLM request failed: {last_exc}")
+        text = _extract_text_from_llm_response(data)
+        if not text.strip():
+            raise LLMServiceError("LLM_UNAVAILABLE", "Empty LLM response")
+        return text
 
     async def healthcheck(self) -> bool:
         if not self.api_key:
@@ -104,13 +72,18 @@ class LLMService:
             if now < self._health_cache_until:
                 return self._health_cache_value
 
-            headers = {"Authorization": f"Bearer {self.api_key}"}
-
             ok = False
             try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
-                    response = await client.get(f"{self.base_url}/models", headers=headers)
-                    response.raise_for_status()
+                await self._post_generate(
+                    {
+                        "model": self.model,
+                        "prompt": 'Return exactly [{"subtopic":"ok","content":"ok"}]',
+                        "temperature": 0,
+                        "max_tokens": 32,
+                    },
+                    retries=1,
+                    timeout=10.0,
+                )
                 ok = True
             except Exception:
                 ok = False
@@ -119,26 +92,72 @@ class LLMService:
             self._health_cache_until = time.monotonic() + max(1, self.health_ttl_seconds)
             return ok
 
+    async def _post_generate(
+        self,
+        payload: dict[str, Any],
+        retries: Optional[int] = None,
+        timeout: Optional[float] = None,
+    ) -> dict[str, Any]:
+        headers = {
+            "X-API-Key": self.api_key,
+            "Content-Type": "application/json",
+        }
+
+        max_retries = retries if retries is not None else self.max_retries
+        req_timeout = timeout if timeout is not None else self.timeout
+
+        async with httpx.AsyncClient(timeout=req_timeout) as client:
+            last_exc: Optional[Exception] = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    response = await client.post(self.api_url, headers=headers, json=payload)
+                    response.raise_for_status()
+                    data = response.json()
+
+                    if isinstance(data, dict) and data.get("success") is False:
+                        raise LLMServiceError("LLM_UNAVAILABLE", str(data.get("error") or "LLM error"))
+
+                    return data if isinstance(data, dict) else {"response": str(data)}
+                except httpx.TimeoutException as exc:
+                    last_exc = exc
+                    if attempt >= max_retries:
+                        raise LLMServiceError("TIMEOUT", "LLM API timeout") from exc
+                except httpx.HTTPStatusError as exc:
+                    last_exc = exc
+                    status_code = exc.response.status_code
+                    if status_code not in {429, 500, 502, 503, 504} or attempt >= max_retries:
+                        raise LLMServiceError("LLM_UNAVAILABLE", f"LLM API returned {status_code}") from exc
+                except LLMServiceError:
+                    raise
+                except httpx.HTTPError as exc:
+                    last_exc = exc
+                    if attempt >= max_retries:
+                        raise LLMServiceError("LLM_UNAVAILABLE", f"LLM API error: {exc}") from exc
+
+                await asyncio.sleep(self.retry_backoff_seconds * attempt)
+
+            raise LLMServiceError("LLM_UNAVAILABLE", f"LLM request failed: {last_exc}")
+
 
 def _extract_text_from_llm_response(data: Any) -> str:
     if isinstance(data, str):
         return data
 
     if isinstance(data, dict):
-        choices = data.get("choices")
-        if isinstance(choices, list) and choices:
-            first = choices[0]
-            if isinstance(first, dict):
-                message = first.get("message")
-                if isinstance(message, dict) and isinstance(message.get("content"), str):
-                    return message["content"]
-                if isinstance(first.get("text"), str):
-                    return first["text"]
-
         for key in ("response", "text", "result", "output", "generated_text", "content"):
             value = data.get(key)
             if isinstance(value, str):
                 return value
+
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                if isinstance(first.get("text"), str):
+                    return first["text"]
+                message = first.get("message")
+                if isinstance(message, dict) and isinstance(message.get("content"), str):
+                    return message["content"]
 
         return json.dumps(data, ensure_ascii=False)
 
