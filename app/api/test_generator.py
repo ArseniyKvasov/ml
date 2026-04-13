@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from app.config import TEST_LLM_MODEL
 from app.schemas import TestRequest, TestSuccessResponse
 from app.services.llm_service import LLMService, LLMServiceError, parse_json_array
 
@@ -15,20 +16,38 @@ async def health() -> dict[str, object]:
 
 @router.post("/generate", response_model=TestSuccessResponse)
 async def generate_test(payload: TestRequest):
-    transcript_text = "\n".join(segment.text.strip() for segment in payload.transcript if segment.text.strip())
-    if not transcript_text:
+    if not payload.summary:
         return JSONResponse(
             status_code=400,
             content={
                 "status": "error",
                 "code": "INVALID_INPUT",
-                "message": "Transcript is empty",
+                "message": "Summary is empty",
+            },
+        )
+
+    summary_chunks = []
+    for item in payload.summary:
+        subtopic = item.subtopic.strip()
+        content = item.content.strip()
+        if not subtopic and not content:
+            continue
+        summary_chunks.append(f"Подтема: {subtopic}\nСодержание: {content}")
+
+    summary_text = "\n\n".join(summary_chunks).strip()
+    if not summary_text:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "code": "INVALID_INPUT",
+                "message": "Summary is empty",
             },
         )
 
     prompt = f"""Ты — эксперт по созданию тестов для проверки знаний на основе лекции.
 
-На основе транскрипта лекции создай тест из {payload.num_questions} вопросов.
+На основе конспекта лекции создай тест из {payload.num_questions} вопросов.
 
 Правила:
 1. Вопросы должны покрывать ключевые темы лекции
@@ -37,7 +56,7 @@ async def generate_test(payload: TestRequest):
 4. Для open_ended: правильный ответ — развернутое объяснение (2-3 предложения)
 5. Если в лекции есть формулы — используй LaTeX: \\( E = mc^2 \\)
 6. Добавь пояснение (explanation) к каждому вопросу
-7. Добавь subtopic — к какой теме лекции относится вопрос
+7. Добавь subtopic — к какой теме лекции относится вопрос.
 
 Формат ответа ТОЛЬКО JSON массив:
 [
@@ -54,12 +73,12 @@ async def generate_test(payload: TestRequest):
 
 Для open_ended поле options = null, correct_answer = "развернутый ответ"
 
-Транскрипт лекции:
-{transcript_text}
+Конспект лекции:
+{summary_text}
 """
 
     try:
-        llm_raw = await llm_service.generate(prompt)
+        llm_raw = await llm_service.generate(prompt, model=TEST_LLM_MODEL)
         test_items = parse_json_array(llm_raw)
     except LLMServiceError as exc:
         status_code = 504 if exc.code == "TIMEOUT" else 502

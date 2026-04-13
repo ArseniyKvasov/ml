@@ -12,8 +12,8 @@ from app.config import (
     LLM_HEALTH_TTL_SECONDS,
     LLM_MAX_RETRIES,
     LLM_MAX_TOKENS,
-    LLM_MODEL,
     LLM_RETRY_BACKOFF_SECONDS,
+    SUMMARY_LLM_MODEL,
     LLM_TEMPERATURE,
     LLM_TIMEOUT_SECONDS,
 )
@@ -34,7 +34,7 @@ class LLMService:
     def __init__(self) -> None:
         self.api_url = LLM_API_URL
         self.api_key = LLM_API_KEY
-        self.model = LLM_MODEL
+        self.default_model = SUMMARY_LLM_MODEL
         self.timeout = LLM_TIMEOUT_SECONDS
         self.temperature = LLM_TEMPERATURE
         self.max_tokens = LLM_MAX_TOKENS
@@ -42,12 +42,13 @@ class LLMService:
         self.retry_backoff_seconds = LLM_RETRY_BACKOFF_SECONDS
         self.health_ttl_seconds = LLM_HEALTH_TTL_SECONDS
 
-    async def generate(self, prompt: str) -> str:
+    async def generate(self, prompt: str, model: Optional[str] = None) -> str:
         if not self.api_key:
             raise LLMServiceError("LLM_UNAVAILABLE", "LLM_API_KEY is not set")
 
+        target_model = model or self.default_model
         payload = {
-            "model": self.model,
+            "model": target_model,
             "prompt": prompt,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
@@ -76,7 +77,7 @@ class LLMService:
             try:
                 await self._post_generate(
                     {
-                        "model": self.model,
+                        "model": self.default_model,
                         "prompt": 'Return exactly [{"subtopic":"ok","content":"ok"}]',
                         "temperature": 0,
                         "max_tokens": 32,

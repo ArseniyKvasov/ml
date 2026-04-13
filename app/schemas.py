@@ -29,7 +29,7 @@ class ErrorResponse(BaseModel):
 
 
 class TestRequest(BaseModel):
-    transcript: List[TranscriptSegment]
+    summary: List[SummaryItem]
     num_questions: conint(ge=1, le=50) = 10
 
 

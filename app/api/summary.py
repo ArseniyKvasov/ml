@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
+from app.config import SUMMARY_LLM_MODEL
 from app.schemas import SummaryRequest, SummarySuccessResponse
 from app.services.llm_service import LLMService, LLMServiceError, parse_json_array
 
@@ -42,7 +43,7 @@ async def summarize(payload: SummaryRequest):
 """
 
     try:
-        llm_raw = await llm_service.generate(prompt)
+        llm_raw = await llm_service.generate(prompt, model=SUMMARY_LLM_MODEL)
         summary_items = parse_json_array(llm_raw)
     except LLMServiceError as exc:
         status_code = 504 if exc.code == "TIMEOUT" else 502
