@@ -4,7 +4,14 @@ from typing import Any
 
 import httpx
 
-from app.config import LLM_API_KEY, LLM_API_URL, LLM_MODEL, LLM_TIMEOUT_SECONDS
+from app.config import (
+    GROQ_API_KEY,
+    GROQ_BASE_URL,
+    LLM_MAX_TOKENS,
+    LLM_MODEL,
+    LLM_TEMPERATURE,
+    LLM_TIMEOUT_SECONDS,
+)
 
 
 class LLMServiceError(Exception):
@@ -16,24 +23,36 @@ class LLMServiceError(Exception):
 
 class LLMService:
     def __init__(self) -> None:
-        self.api_url = LLM_API_URL
-        self.api_key = LLM_API_KEY
+        self.base_url = GROQ_BASE_URL.rstrip("/")
+        self.api_key = GROQ_API_KEY
         self.model = LLM_MODEL
         self.timeout = LLM_TIMEOUT_SECONDS
+        self.temperature = LLM_TEMPERATURE
+        self.max_tokens = LLM_MAX_TOKENS
 
     async def generate(self, prompt: str) -> str:
-        headers = {"X-API-Key": self.api_key}
+        if not self.api_key:
+            raise LLMServiceError("LLM_UNAVAILABLE", "GROQ_API_KEY is not set")
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
         payload = {
             "model": self.model,
-            "prompt": prompt,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
         }
 
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(self.api_url, headers=headers, json=payload)
+                response = await client.post(f"{self.base_url}/chat/completions", headers=headers, json=payload)
                 response.raise_for_status()
         except httpx.TimeoutException as exc:
             raise LLMServiceError("TIMEOUT", "LLM API timeout") from exc
+        except httpx.HTTPStatusError as exc:
+            raise LLMServiceError("LLM_UNAVAILABLE", f"LLM API returned {exc.response.status_code}") from exc
         except httpx.HTTPError as exc:
             raise LLMServiceError("LLM_UNAVAILABLE", f"LLM API error: {exc}") from exc
 
@@ -44,14 +63,14 @@ class LLMService:
         return text
 
     async def healthcheck(self) -> bool:
+        if not self.api_key:
+            return False
+
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+
         try:
-            headers = {"X-API-Key": self.api_key}
-            payload = {
-                "model": self.model,
-                "prompt": 'Return valid JSON array: [{"subtopic":"ok","content":"ok"}]',
-            }
             async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.post(self.api_url, headers=headers, json=payload)
+                response = await client.get(f"{self.base_url}/models", headers=headers)
                 response.raise_for_status()
             return True
         except Exception:
@@ -63,20 +82,20 @@ def _extract_text_from_llm_response(data: Any) -> str:
         return data
 
     if isinstance(data, dict):
-        for key in ("response", "text", "result", "output", "generated_text", "content"):
-            value = data.get(key)
-            if isinstance(value, str):
-                return value
-
         choices = data.get("choices")
         if isinstance(choices, list) and choices:
             first = choices[0]
             if isinstance(first, dict):
-                if isinstance(first.get("text"), str):
-                    return first["text"]
                 message = first.get("message")
                 if isinstance(message, dict) and isinstance(message.get("content"), str):
                     return message["content"]
+                if isinstance(first.get("text"), str):
+                    return first["text"]
+
+        for key in ("response", "text", "result", "output", "generated_text", "content"):
+            value = data.get(key)
+            if isinstance(value, str):
+                return value
 
         return json.dumps(data, ensure_ascii=False)
 
@@ -89,7 +108,6 @@ def _extract_text_from_llm_response(data: Any) -> str:
 def parse_json_array(raw_text: str) -> list[dict[str, Any]]:
     text = raw_text.strip()
 
-    # Drop markdown fences if present.
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?", "", text).strip()
         if text.endswith("```"):
