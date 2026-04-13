@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import re
 import time
 from typing import Any, Optional
@@ -17,6 +18,8 @@ from app.config import (
     LLM_TEMPERATURE,
     LLM_TIMEOUT_SECONDS,
 )
+
+logger = logging.getLogger("app")
 
 
 class LLMServiceError(Exception):
@@ -121,17 +124,39 @@ class LLMService:
                     return data if isinstance(data, dict) else {"response": str(data)}
                 except httpx.TimeoutException as exc:
                     last_exc = exc
+                    logger.warning(
+                        "LLM timeout (attempt %s/%s) model=%s",
+                        attempt,
+                        max_retries,
+                        payload.get("model"),
+                    )
                     if attempt >= max_retries:
                         raise LLMServiceError("TIMEOUT", "LLM API timeout") from exc
                 except httpx.HTTPStatusError as exc:
                     last_exc = exc
                     status_code = exc.response.status_code
+                    body_preview = exc.response.text[:400] if exc.response.text else ""
+                    logger.warning(
+                        "LLM HTTP error (attempt %s/%s) model=%s status=%s body=%s",
+                        attempt,
+                        max_retries,
+                        payload.get("model"),
+                        status_code,
+                        body_preview,
+                    )
                     if status_code not in {429, 500, 502, 503, 504} or attempt >= max_retries:
                         raise LLMServiceError("LLM_UNAVAILABLE", f"LLM API returned {status_code}") from exc
                 except LLMServiceError:
                     raise
                 except httpx.HTTPError as exc:
                     last_exc = exc
+                    logger.warning(
+                        "LLM transport error (attempt %s/%s) model=%s error=%s",
+                        attempt,
+                        max_retries,
+                        payload.get("model"),
+                        str(exc),
+                    )
                     if attempt >= max_retries:
                         raise LLMServiceError("LLM_UNAVAILABLE", f"LLM API error: {exc}") from exc
 

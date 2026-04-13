@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
@@ -7,6 +9,7 @@ from app.services.llm_service import LLMService, LLMServiceError, parse_json_arr
 
 router = APIRouter(prefix="/test", tags=["test"])
 llm_service = LLMService()
+logger = logging.getLogger("app")
 
 
 @router.get("/health")
@@ -57,6 +60,9 @@ async def generate_test(payload: TestRequest):
 5. Если в лекции есть формулы — используй LaTeX: \\( E = mc^2 \\)
 6. Добавь пояснение (explanation) к каждому вопросу
 7. Добавь subtopic — к какой теме лекции относится вопрос.
+8. Верни только валидный JSON-массив и ничего больше.
+9. Не используй markdown, кодовые блоки, комментарии, префиксы или пояснения.
+10. JSON должен начинаться с [ и заканчиваться ].
 
 Формат ответа ТОЛЬКО JSON массив:
 [
@@ -77,10 +83,18 @@ async def generate_test(payload: TestRequest):
 {summary_text}
 """
 
+    llm_raw = ""
     try:
         llm_raw = await llm_service.generate(prompt, model=TEST_LLM_MODEL)
         test_items = parse_json_array(llm_raw)
     except LLMServiceError as exc:
+        logger.warning(
+            "Test generation failed code=%s model=%s error=%s raw_preview=%s",
+            exc.code,
+            TEST_LLM_MODEL,
+            exc.message,
+            llm_raw[:600],
+        )
         status_code = 504 if exc.code == "TIMEOUT" else 502
         return JSONResponse(
             status_code=status_code,
@@ -100,6 +114,12 @@ async def generate_test(payload: TestRequest):
     validated = []
     for item in test_items:
         if not isinstance(item, dict) or not required.issubset(item.keys()):
+            logger.warning(
+                "Test validation failed (missing fields) model=%s item=%s raw_preview=%s",
+                TEST_LLM_MODEL,
+                str(item)[:500],
+                llm_raw[:600],
+            )
             return JSONResponse(
                 status_code=400,
                 content={
@@ -111,6 +131,12 @@ async def generate_test(payload: TestRequest):
 
         question_type = item["question_type"]
         if question_type not in {"multiple_choice", "open_ended"}:
+            logger.warning(
+                "Test validation failed (question_type) model=%s item=%s raw_preview=%s",
+                TEST_LLM_MODEL,
+                str(item)[:500],
+                llm_raw[:600],
+            )
             return JSONResponse(
                 status_code=400,
                 content={
