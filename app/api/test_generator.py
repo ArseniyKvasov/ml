@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from app.config import TEST_LLM_MODEL
+from app.config import MODEL_FALLBACK_ATTEMPTS, TEST_MODEL_CANDIDATES
 from app.schemas import TestRequest, TestSuccessResponse
 from app.services.llm_service import LLMService, LLMServiceError, parse_json_array
 
@@ -83,69 +83,80 @@ async def generate_test(payload: TestRequest):
 {summary_text}
 """
 
-    llm_raw = ""
-    try:
-        llm_raw = await llm_service.generate(prompt, model=TEST_LLM_MODEL)
-        test_items = parse_json_array(llm_raw)
-    except LLMServiceError as exc:
-        logger.warning(
-            "Test generation failed code=%s model=%s error=%s raw_preview=%s",
-            exc.code,
-            TEST_LLM_MODEL,
-            exc.message,
-            llm_raw[:600],
-        )
-        status_code = 504 if exc.code == "TIMEOUT" else 502
-        return JSONResponse(
-            status_code=status_code,
-            content={"status": "error", "code": exc.code, "message": exc.message},
-        )
+    attempts = min(max(1, MODEL_FALLBACK_ATTEMPTS), max(1, len(TEST_MODEL_CANDIDATES)))
+    required = {"question_id", "question_text", "question_type", "options", "correct_answer", "explanation", "subtopic"}
+    last_error_code = "LLM_UNAVAILABLE"
+    last_error_message = "Failed to generate test with fallback models"
+    last_status_code = 502
 
-    required = {
-        "question_id",
-        "question_text",
-        "question_type",
-        "options",
-        "correct_answer",
-        "explanation",
-        "subtopic",
-    }
-
-    validated = []
-    for item in test_items:
-        if not isinstance(item, dict) or not required.issubset(item.keys()):
+    for idx in range(attempts):
+        model = TEST_MODEL_CANDIDATES[idx]
+        llm_raw = ""
+        try:
+            llm_raw = await llm_service.generate(prompt, model=model)
+            test_items = parse_json_array(llm_raw)
+        except LLMServiceError as exc:
             logger.warning(
-                "Test validation failed (missing fields) model=%s item=%s raw_preview=%s",
-                TEST_LLM_MODEL,
-                str(item)[:500],
+                "Test generation failed attempt=%s/%s model=%s code=%s error=%s raw_preview=%s",
+                idx + 1,
+                attempts,
+                model,
+                exc.code,
+                exc.message,
                 llm_raw[:600],
             )
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "status": "error",
-                    "code": "INVALID_INPUT",
-                    "message": "Invalid test JSON structure",
-                },
-            )
+            last_error_code = exc.code
+            last_error_message = exc.message
+            last_status_code = 504 if exc.code == "TIMEOUT" else 502
+            continue
 
-        question_type = item["question_type"]
-        if question_type not in {"multiple_choice", "open_ended"}:
-            logger.warning(
-                "Test validation failed (question_type) model=%s item=%s raw_preview=%s",
-                TEST_LLM_MODEL,
-                str(item)[:500],
-                llm_raw[:600],
-            )
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "status": "error",
-                    "code": "INVALID_INPUT",
-                    "message": "question_type must be multiple_choice or open_ended",
-                },
-            )
+        validated = []
+        valid = True
+        for item in test_items:
+            if not isinstance(item, dict) or not required.issubset(item.keys()):
+                logger.warning(
+                    "Test validation failed (missing fields) attempt=%s/%s model=%s item=%s raw_preview=%s",
+                    idx + 1,
+                    attempts,
+                    model,
+                    str(item)[:500],
+                    llm_raw[:600],
+                )
+                valid = False
+                last_error_code = "INVALID_INPUT"
+                last_error_message = "Invalid test JSON structure"
+                last_status_code = 502
+                break
 
-        validated.append(item)
+            question_type = item["question_type"]
+            if question_type not in {"multiple_choice", "open_ended"}:
+                logger.warning(
+                    "Test validation failed (question_type) attempt=%s/%s model=%s item=%s raw_preview=%s",
+                    idx + 1,
+                    attempts,
+                    model,
+                    str(item)[:500],
+                    llm_raw[:600],
+                )
+                valid = False
+                last_error_code = "INVALID_INPUT"
+                last_error_message = "question_type must be multiple_choice or open_ended"
+                last_status_code = 502
+                break
 
-    return {"status": "success", "test": validated}
+            validated.append(item)
+
+        if valid:
+            logger.info(
+                "Test generation success attempt=%s/%s model=%s items=%s",
+                idx + 1,
+                attempts,
+                model,
+                len(validated),
+            )
+            return {"status": "success", "test": validated}
+
+    return JSONResponse(
+        status_code=last_status_code,
+        content={"status": "error", "code": last_error_code, "message": last_error_message},
+    )

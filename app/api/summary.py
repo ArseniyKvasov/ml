@@ -3,7 +3,7 @@ import logging
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
-from app.config import SUMMARY_LLM_MODEL
+from app.config import MODEL_FALLBACK_ATTEMPTS, SUMMARY_MODEL_CANDIDATES
 from app.schemas import SummaryRequest, SummarySuccessResponse
 from app.services.llm_service import LLMService, LLMServiceError, parse_json_array
 
@@ -49,46 +49,67 @@ async def summarize(payload: SummaryRequest):
 {transcript_text}
 """
 
-    llm_raw = ""
-    try:
-        llm_raw = await llm_service.generate(prompt, model=SUMMARY_LLM_MODEL)
-        summary_items = parse_json_array(llm_raw)
-    except LLMServiceError as exc:
-        logger.warning(
-            "Summary generation failed code=%s model=%s error=%s raw_preview=%s",
-            exc.code,
-            SUMMARY_LLM_MODEL,
-            exc.message,
-            llm_raw[:600],
-        )
-        status_code = 504 if exc.code == "TIMEOUT" else 502
-        return JSONResponse(
-            status_code=status_code,
-            content={"status": "error", "code": exc.code, "message": exc.message},
-        )
+    attempts = min(max(1, MODEL_FALLBACK_ATTEMPTS), max(1, len(SUMMARY_MODEL_CANDIDATES)))
+    last_error_code = "LLM_UNAVAILABLE"
+    last_error_message = "Failed to generate summary with fallback models"
+    last_status_code = 502
 
-    validated = []
-    for item in summary_items:
-        if not isinstance(item, dict) or "subtopic" not in item or "content" not in item:
+    for idx in range(attempts):
+        model = SUMMARY_MODEL_CANDIDATES[idx]
+        llm_raw = ""
+        try:
+            llm_raw = await llm_service.generate(prompt, model=model)
+            summary_items = parse_json_array(llm_raw)
+        except LLMServiceError as exc:
             logger.warning(
-                "Summary validation failed model=%s item=%s raw_preview=%s",
-                SUMMARY_LLM_MODEL,
-                str(item)[:400],
+                "Summary generation failed attempt=%s/%s model=%s code=%s error=%s raw_preview=%s",
+                idx + 1,
+                attempts,
+                model,
+                exc.code,
+                exc.message,
                 llm_raw[:600],
             )
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "status": "error",
-                    "code": "INVALID_INPUT",
-                    "message": "Invalid summary JSON structure",
-                },
-            )
-        validated.append(
-            {
-                "subtopic": str(item["subtopic"]).strip(),
-                "content": str(item["content"]).strip(),
-            }
-        )
+            last_error_code = exc.code
+            last_error_message = exc.message
+            last_status_code = 504 if exc.code == "TIMEOUT" else 502
+            continue
 
-    return {"status": "success", "summary": validated}
+        validated = []
+        valid = True
+        for item in summary_items:
+            if not isinstance(item, dict) or "subtopic" not in item or "content" not in item:
+                logger.warning(
+                    "Summary validation failed attempt=%s/%s model=%s item=%s raw_preview=%s",
+                    idx + 1,
+                    attempts,
+                    model,
+                    str(item)[:400],
+                    llm_raw[:600],
+                )
+                valid = False
+                last_error_code = "INVALID_INPUT"
+                last_error_message = "Invalid summary JSON structure"
+                last_status_code = 502
+                break
+            validated.append(
+                {
+                    "subtopic": str(item["subtopic"]).strip(),
+                    "content": str(item["content"]).strip(),
+                }
+            )
+
+        if valid:
+            logger.info(
+                "Summary generation success attempt=%s/%s model=%s items=%s",
+                idx + 1,
+                attempts,
+                model,
+                len(validated),
+            )
+            return {"status": "success", "summary": validated}
+
+    return JSONResponse(
+        status_code=last_status_code,
+        content={"status": "error", "code": last_error_code, "message": last_error_message},
+    )
